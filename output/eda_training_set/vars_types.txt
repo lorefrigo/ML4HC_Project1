@@ -1,0 +1,42 @@
+--- CATEGORICAL / CODE VARIABLES ---
+- GCS
+- Gender
+
+--- NUMERICAL VARIABLES ---
+- ALP
+- ALT
+- AST
+- Age
+- Albumin
+- BUN
+- Bilirubin
+- Cholesterol
+- Creatinine
+- DiasABP
+- FiO2
+- Glucose
+- HCO3
+- HCT
+- HR
+- Height
+- K
+- Lactate
+- MAP
+- Mg
+- NIDiasABP
+- NIMAP
+- NISysABP
+- Na
+- PaCO2
+- PaO2
+- Platelets
+- RespRate
+- SaO2
+- SysABP
+- Temp
+- TroponinI
+- TroponinT
+- Urine
+- WBC
+- Weight
+- pH
