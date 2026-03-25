@@ -11,3 +11,6 @@ wheels/
 
 # Data
 ml4h_data
+
+# MacOS
+.DS_Store
