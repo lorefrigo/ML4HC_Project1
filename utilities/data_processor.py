@@ -65,7 +65,8 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         
         self.static_vars = ['Age', 'Gender', 'Height', 'Weight']
         self.exclude_vars = ['PatientID', 'Timestamp', 'Label', 'AgeBin']
-        self.cat_vars = ['Gender']
+        self.cat_vars = []
+        self.ordinal_vars = ['GCS', 'Gender']
         
         self.age_bins = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
         self.age_labels = ['0-9', '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70-79', '80-89', '90-99', '100-109', '110-119']
@@ -97,6 +98,9 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
             
         if 'Age' in df_fixed.columns:
             df_fixed['AgeBin'] = pd.cut(df_fixed['Age'], bins=self.age_bins, labels=self.age_labels, right=False)
+            
+        if 'Gender' in df_fixed.columns:
+            df_fixed.loc[df_fixed['Gender'] == -1.0, 'Gender'] = np.nan
             
         return df_fixed
 
@@ -134,11 +138,18 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         self.agebin_medians_ = df_clean.groupby('AgeBin', observed=True).median().to_dict('index')
         self.overall_medians_ = df_clean[[v for v in self.num_vars if v in df_clean.columns]].median().to_dict()
 
-        # Perform temporary imputation to safely calculate skewness and scalers without NaNs breaking it
-        dfTemp = self._impute_dataframe(df_clean)
+        if 'Gender' in df_clean.columns:
+            self.agebin_gender_mode_ = df_clean.groupby('AgeBin', observed=True)['Gender'].agg(lambda x: x.mode()[0] if len(x.mode()) > 0 else np.nan).to_dict()
+            self.cohort_gender_mode_ = df_clean['Gender'].mode()[0] if len(df_clean['Gender'].mode()) > 0 else np.nan
+
+        # Perform extremely quick generalized imputation to safely calculate skew parameters
+        dfTemp = df_clean.copy()
+        for var, median_val in self.overall_medians_.items():
+            if var in dfTemp.columns:
+                dfTemp[var] = dfTemp[var].fillna(median_val)
         
-        # Calculate skewness
-        present_num = [v for v in self.num_vars if v in dfTemp.columns]
+        # Calculate skewness on continuous variables only 
+        present_num = [v for v in self.num_vars if v in dfTemp.columns and v not in self.ordinal_vars]
         if present_num:
             skewness_values = dfTemp[present_num].skew()
             self.highly_skewed_ = skewness_values[(skewness_values > 1) | (skewness_values < -1)].index.tolist()
@@ -166,39 +177,38 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
             
         return self
 
-    def _resolve_median_fallback(self, gender, agebin, var):
-        """
-        Auxiliary method to resolve a missing value using a cascading median fallback.
+    def _apply_vectorized_fallback(self, df_processed, var, mask):
+        if not mask.any(): return df_processed
         
-        Priority:
-        1. Median of the variable at hour 0, matched by Gender and AgeBin.
-        2. Median of the variable across all hours, matched by Gender and AgeBin.
-        3. Median of the variable across all hours, matched only by AgeBin.
-        4. Absolute median of the variable across the entire training dataset.
-        """
-        val = np.nan
-        # 1. Try first_val_medians_ by Gender and AgeBin
-        if pd.notna(gender) and pd.notna(agebin):
-            key = (gender, agebin)
-            if hasattr(self, 'first_val_medians_') and key in self.first_val_medians_ and var in self.first_val_medians_[key]:
-                val = self.first_val_medians_[key][var]
-                
-        # 2. Try global_medians_ by Gender and AgeBin
-        if pd.isna(val) and pd.notna(gender) and pd.notna(agebin):
-            key = (gender, agebin)
-            if hasattr(self, 'global_medians_') and key in self.global_medians_ and var in self.global_medians_[key]:
-                val = self.global_medians_[key][var]
-                
-        # 3. Try agebin_medians_ (if missing gender or above failed)
-        if pd.isna(val) and pd.notna(agebin):
-            if hasattr(self, 'agebin_medians_') and agebin in self.agebin_medians_ and var in self.agebin_medians_[agebin]:
-                val = self.agebin_medians_[agebin][var]
-                
-        # 4. Overall global median
-        if pd.isna(val) and hasattr(self, 'overall_medians_') and var in self.overall_medians_:
-            val = self.overall_medians_[var]
+        if var == 'Gender':
+            mapped_agebin = df_processed.loc[mask, 'AgeBin'].map(lambda x: getattr(self, 'agebin_gender_mode_', {}).get(x, np.nan))
+            df_processed.loc[mask, var] = df_processed.loc[mask, var].fillna(mapped_agebin)
+            df_processed.loc[mask, var] = df_processed.loc[mask, var].fillna(getattr(self, 'cohort_gender_mode_', np.nan))
+        else:
+            # Map combinations directly into sequence dictionary keys 
+            mapped_tuple = pd.Series(list(zip(df_processed.loc[mask, 'Gender'], df_processed.loc[mask, 'AgeBin'])), index=df_processed[mask].index)
             
-        return val
+            mapped_first = mapped_tuple.map(lambda x: getattr(self, 'first_val_medians_', {}).get(x, {}).get(var, np.nan) if pd.notna(x[0]) and pd.notna(x[1]) else np.nan)
+            df_processed.loc[mask, var] = df_processed.loc[mask, var].fillna(mapped_first)
+            
+            mask_rem = df_processed[var].isna() & mask
+            if not mask_rem.any(): return df_processed
+            
+            mapped_global = mapped_tuple.loc[mask_rem].map(lambda x: getattr(self, 'global_medians_', {}).get(x, {}).get(var, np.nan) if pd.notna(x[0]) and pd.notna(x[1]) else np.nan)
+            df_processed.loc[mask_rem, var] = df_processed.loc[mask_rem, var].fillna(mapped_global)
+            
+            mask_rem = df_processed[var].isna() & mask
+            if not mask_rem.any(): return df_processed
+            
+            mapped_agebin = df_processed.loc[mask_rem, 'AgeBin'].map(lambda x: getattr(self, 'agebin_medians_', {}).get(x, {}).get(var, np.nan) if pd.notna(x) else np.nan)
+            df_processed.loc[mask_rem, var] = df_processed.loc[mask_rem, var].fillna(mapped_agebin)
+            
+            mask_rem = df_processed[var].isna() & mask
+            if not mask_rem.any(): return df_processed
+            
+            df_processed.loc[mask_rem, var] = df_processed.loc[mask_rem, var].fillna(getattr(self, 'overall_medians_', {}).get(var, np.nan))
+            
+        return df_processed
 
     def _impute_dataframe(self, df):
         """
@@ -216,14 +226,8 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         num_present = [v for v in self.num_vars if v in df_processed.columns]
         if num_present:
             for var in num_present:
-                if df_processed[var].isna().any():
-                    # Apply the cascading median fallback to any remaining NaNs
-                    missing_mask = df_processed[var].isna()
-                    for idx in df_processed[missing_mask].index:
-                        gender = df_processed.at[idx, 'Gender'] if 'Gender' in df_processed.columns else np.nan
-                        agebin = df_processed.at[idx, 'AgeBin'] if 'AgeBin' in df_processed.columns else np.nan
-                        
-                        df_processed.at[idx, var] = self._resolve_median_fallback(gender, agebin, var)
+                mask = df_processed[var].isna()
+                df_processed = self._apply_vectorized_fallback(df_processed, var, mask)
                         
         return df_processed
 
@@ -234,9 +238,6 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         Outlier Imputation Logic:
         - If an out-of-bound measurement returns to normal bounds on the very next reading, 
           it is considered an implausible sensor "blip" and is overwritten.
-        - If the outlier persists or lacks future readings, and the patient survived, it is 
-          also considered an anomaly and removed. (If Label is unavailable during inference, 
-          survival is safely assumed to decouple preprocessing from target leakage).
         - Replaced outliers are overwritten via forward-fill of previously known normal values, 
           or via cascading cohort medians if the outlier occurred on the first timestamp.
           
@@ -255,37 +256,32 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         df_processed = df_processed.sort_values(by=['PatientID', 'Timestamp'])
 
         if self.impute_outliers:
-            for var, (min_val, max_val) in self.physiologically_plausible.items():
-                if var not in df_processed.columns: continue
+            plausible_cols = [v for v in self.physiologically_plausible.keys() if v in df_processed.columns]
+            
+            if plausible_cols:
+                # Create boolean validity masks
+                valid_mask = pd.DataFrame(index=df_processed.index, columns=plausible_cols)
+                is_outlier_mask = pd.DataFrame(index=df_processed.index, columns=plausible_cols)
                 
-                is_valid = df_processed[var].between(min_val, max_val) & df_processed[var].notna()
-                valid_series = df_processed[var].where(is_valid)
-                ffill_values = valid_series.groupby(df_processed['PatientID']).ffill()
-                next_valid = valid_series.groupby(df_processed['PatientID']).bfill().shift(-1)
+                for var in plausible_cols:
+                    min_val, max_val = self.physiologically_plausible[var]
+                    valid_mask[var] = df_processed[var].between(min_val, max_val)
+                    is_outlier_mask[var] = (df_processed[var] < min_val) | (df_processed[var] > max_val)
                 
-                is_outlier = (df_processed[var] < min_val) | (df_processed[var] > max_val)
+                valid_df = df_processed[plausible_cols].where(valid_mask)
                 
-                if 'Label' in df_processed.columns:
-                    patient_survived = (df_processed['Label'] == 0)
-                else:
-                    patient_survived = pd.Series(True, index=df_processed.index)
-                    warnings.warn("No 'Label' found on Inference. Assuming survival for outlier plausibility evaluation to prevent target leakage.")
+                # Bulk GroupBy calculations (massive speedup + bfill boundary bug fix)
+                ffill_df = valid_df.groupby(df_processed['PatientID']).ffill()
+                next_valid_df = valid_df.groupby(df_processed['PatientID']).bfill().groupby(df_processed['PatientID']).shift(-1)
                 
-                implausible_blip = is_outlier & next_valid.between(min_val, max_val)
-                implausible_survived = is_outlier & (~next_valid.between(min_val, max_val) | next_valid.isna()) & patient_survived
-                implausible_mask = implausible_blip | implausible_survived
-                
-                # Decoupled direct overwrite using previously known clean states
-                df_processed.loc[implausible_mask, var] = ffill_values.loc[implausible_mask]
-                
-                # If outlier was first event, ffill exposes NaN. Impute safely via cascading fallback.
-                missing_mask = implausible_mask & df_processed[var].isna()
-                if missing_mask.any():
-                    for idx in df_processed[missing_mask].index:
-                        gender = df_processed.at[idx, 'Gender'] if 'Gender' in df_processed.columns else np.nan
-                        agebin = df_processed.at[idx, 'AgeBin'] if 'AgeBin' in df_processed.columns else np.nan
+                for var in plausible_cols:
+                    implausible_mask = is_outlier_mask[var] & next_valid_df[var].notna()
+                    if implausible_mask.any():
+                        df_processed.loc[implausible_mask, var] = ffill_df.loc[implausible_mask, var]
+                        missing_mask = implausible_mask & df_processed[var].isna()
                         
-                        df_processed.at[idx, var] = self._resolve_median_fallback(gender, agebin, var)
+                        # Apply fallback for first-event blips
+                        df_processed = self._apply_vectorized_fallback(df_processed, var, missing_mask)
         
         if self.impute_missing:
             df_processed = self._impute_dataframe(df_processed)
