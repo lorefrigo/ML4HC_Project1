@@ -17,7 +17,20 @@ from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.metrics import roc_auc_score, average_precision_score
-from utilities.data_processor import DataPreprocessor
+
+# Define constants and feature lists 
+T_MAX = 2880.0  # 48 hours in minutes
+STATIC_VARS = ['Age', 'Height', 'Weight', 'Gender']
+DYNAMIC_VARS = [
+    'Albumin', 'ALP', 'ALT', 'AST', 'Bilirubin', 'BUN', 'Cholesterol', 'Creatinine', 
+    'DiasABP', 'FiO2', 'GCS', 'Glucose', 'HCO3', 'HCT', 'HR', 'K', 'Lactate', 'Mg', 
+    'MAP', 'MechVent', 'Na', 'NIDiasABP', 'NIMAP', 'NISysABP', 'PaCO2', 'PaO2', 
+    'pH', 'Platelets', 'RespRate', 'SaO2', 'SysABP', 'Temp', 'TroponinI', 'TroponinT', 
+    'Urine', 'WBC'
+]
+ALL_FEATURES = sorted(list(set(DYNAMIC_VARS + STATIC_VARS))) # 41 Categories
+
+
 
 ###############
 def set_seed(seed: int) -> None:
@@ -135,6 +148,32 @@ def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch
     
     return t_pad, z_pad, v_pad, torch.stack(labels), mask
 
+def clip_feature_values(
+    df: pd.DataFrame, 
+    features: list[str], 
+    min_val: float = -5.0, 
+    max_val: float = 5.0
+) -> pd.DataFrame:
+    """
+    Clips specific numerical features within a user-defined range.
+    
+    Args:
+        df: The input DataFrame (e.g., scaled_a).
+        features: List of column names to apply clipping to.
+        min_val: The lower bound (default -5.0).
+        max_val: The upper bound (default 5.0).
+        
+    Returns:
+        A copy of the DataFrame with clipped values.
+    """
+    df_clipped = df.copy()
+    
+    # Apply clipping only to the specified feature columns
+    df_clipped[features] = df_clipped[features].clip(lower=min_val, upper=max_val)
+    
+    print(f"Data clipped to range: [{min_val}, {max_val}] for {len(features)} features.")
+    return df_clipped
+
 
 ################################
 class SinusoidalTimeEmbedding(nn.Module):
@@ -173,6 +212,38 @@ class TripletEmbedding(nn.Module):
         return self.projection(combined)
 ################
 
+class SwiGLUEncoderLayer(nn.Module):
+    """
+    Custom Transformer Encoder Layer using Pre-LN and a SwiGLU FeedForward Network.
+    """
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        
+        # SwiGLU components
+        self.w1 = nn.Linear(d_model, dim_feedforward)
+        self.w2 = nn.Linear(d_model, dim_feedforward)
+        self.w3 = nn.Linear(dim_feedforward, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src: torch.Tensor, src_mask: torch.Tensor = None, src_key_padding_mask: torch.Tensor = None, **kwargs) -> torch.Tensor:
+        # Pre-LN Self-Attention
+        src_norm = self.norm1(src)
+        attn_out, _ = self.self_attn(src_norm, src_norm, src_norm, key_padding_mask=src_key_padding_mask, need_weights=False)
+        src = src + self.dropout(attn_out)
+        
+        # Pre-LN SwiGLU FFN
+        src_norm = self.norm2(src)
+        gate = F.silu(self.w1(src_norm))
+        ffn_inner = gate * self.w2(src_norm)
+        ffn_out = self.w3(self.dropout(ffn_inner))
+        
+        src = src + self.dropout(ffn_out)
+        return src
+
 class TransformerModel(nn.Module):
     def __init__(
         self, 
@@ -186,12 +257,11 @@ class TransformerModel(nn.Module):
         super().__init__()
         self.embedding = TripletEmbedding(d_model, d_time_emb)
         
-        encoder_layer = nn.TransformerEncoderLayer(
+        encoder_layer = SwiGLUEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
             dim_feedforward=dim_feedforward, 
-            dropout=dropout,
-            batch_first=True
+            dropout=dropout
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
@@ -209,9 +279,10 @@ class TransformerModel(nn.Module):
         mask_expanded = mask.unsqueeze(-1).float() 
         inv_mask = 1.0 - mask_expanded 
         
-        sum_x = torch.sum(x * inv_mask, dim=1)
+        # Cast to float32 BEFORE summing to prevent fp16 numerical overflow on long patient sequences
+        sum_x = torch.sum(x.to(torch.float32) * inv_mask, dim=1)
         count_x = torch.clamp(torch.sum(inv_mask, dim=1), min=1e-9)
-        pooled_x = sum_x / count_x
+        pooled_x = (sum_x / count_x).to(x.dtype)
         
         return self.classifier(pooled_x)
 
@@ -224,7 +295,6 @@ def train_one_epoch(
     dataloader: DataLoader, 
     optimizer: torch.optim.Optimizer, 
     device: torch.device,
-    scaler: Any = None
 ) -> Dict[str, float]:
     """
     Trains the model for one epoch on processed dataset.
@@ -233,9 +303,7 @@ def train_one_epoch(
         model: The Transformer model with TripletEmbedding.
         dataloader: DataLoader for Set A.
         optimizer: PyTorch optimizer (e.g., Adam).
-        device: 'cuda' or 'cpu'.
-        scaler: GradScaler for mixed precision.
-        
+        device: 'cuda' or 'cpu'.        
     Returns:
         dict: Average loss, AuROC, and AuPRC for the epoch.
     """
@@ -253,18 +321,13 @@ def train_one_epoch(
 
         # Forward pass: Pass triplets and the padding mask to the model 
         # The mask ensures the Transformer ignores padded 'empty' triplets
-        with torch.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-            logits = model(t_pad, z_pad, v_pad, mask)
-            loss = model.compute_loss(logits.view(-1), labels)
+        logits = model(t_pad, z_pad, v_pad, mask)
+        loss = model.compute_loss(logits.view(-1), labels)
         
         # Backward pass
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
         # Track statistics
         train_loss += loss.item()
@@ -370,21 +433,21 @@ def run_training_pipeline(
     # Initialize the run directory
     save_dir, run_name = setup_run_directory(save_dir)
     
-    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+    #scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
 
     best_val_auprc = 0.0
     history: dict[str, list[dict[str, float]]] = {"train": [], "val": []}
 
     for epoch in range(1, epochs + 1):
         # Train and Validate
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, scaler=scaler)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device)
         val_metrics = evaluate(model, val_loader, device)
         
         # Update History
         history["train"].append(train_metrics)
         history["val"].append(val_metrics)
 
-        print(f"Epoch {epoch:02d} | Train Loss: {train_metrics['loss']:.4f} | "
+        print(f"Epoch {epoch:02d} | Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f} | "
               f"Val AuROC: {val_metrics['auroc']:.4f} | Val AuPRC: {val_metrics['auprc']:.4f}")
 
         # Checkpointing 
@@ -402,7 +465,8 @@ def run_training_pipeline(
     return {
         "best_val_auprc": best_val_auprc,
         "history": history,
-        "save_dir": save_dir
+        "save_dir": save_dir,
+        "run_name": run_name
     }
 
 ###############
@@ -518,7 +582,7 @@ def run_final_test(
 def report_test_results(results: dict[str, float], model_name: str = "Transformer (Task 2.3b)") -> None:
     """
     Prints a formatted report of the test set performance and generates 
-    a LaTeX table row for the assignment report.
+    a LaTeX table row.
     """
     print("\n" + "="*45)
     print(f" FINAL PERFORMANCE REPORT: {model_name}")
@@ -537,7 +601,6 @@ def report_test_results(results: dict[str, float], model_name: str = "Transforme
         f"{results['auprc']:.4f} & {results['loss']:.4f} \\\\"
     )
     
-    print("\n[LaTeX Table Row for your Report]")
     print(latex_row)
     print("="*45 + "\n")
 
@@ -582,130 +645,4 @@ def clean_checkpoint_dir(
                 print(f"  [Preserved] {item.name} (Best Model)")
 
     print(f"\nCleanup complete. Removed {deleted_count} old run directories.")
-
-######################################
-
-# Enforce reproducibility before any execution logic
-SEED = 42
-set_seed(SEED)
-
-rnd_generator = torch.Generator()
-rnd_generator.manual_seed(SEED)
-
-###############
-
-# Initialization for model and hyperparameters
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-run_name = f"run_{timestamp}"
-save_directory = f"model_checkpoints/task_2_3b/{run_name}"
-epochs = 2
-
-model = TransformerModel(
-    d_model=64,
-    nhead=4,
-    num_layers=3,
-    d_time_emb=16,
-    dim_feedforward=128,
-    dropout=0.1
-).to(device)
-
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-######################################
-# Define constants and feature lists 
-T_MAX = 2880.0  # 48 hours in minutes
-STATIC_VARS = ['Age', 'Height', 'Weight', 'Gender']
-DYNAMIC_VARS = [
-    'Albumin', 'ALP', 'ALT', 'AST', 'Bilirubin', 'BUN', 'Cholesterol', 'Creatinine', 
-    'DiasABP', 'FiO2', 'GCS', 'Glucose', 'HCO3', 'HCT', 'HR', 'K', 'Lactate', 'Mg', 
-    'MAP', 'MechVent', 'Na', 'NIDiasABP', 'NIMAP', 'NISysABP', 'PaCO2', 'PaO2', 
-    'pH', 'Platelets', 'RespRate', 'SaO2', 'SysABP', 'Temp', 'TroponinI', 'TroponinT', 
-    'Urine', 'WBC'
-]
-ALL_FEATURES = sorted(list(set(DYNAMIC_VARS + STATIC_VARS))) # 41 Categories
-
-##############
-
-raw_a, labels_a = load_raw_to_grid('ml4h_data/p1/set-a/', 'ml4h_data/p1/Outcomes-a.txt')
-raw_b, labels_b = load_raw_to_grid('ml4h_data/p1/set-b/', 'ml4h_data/p1/Outcomes-b.txt')
-raw_c, labels_c = load_raw_to_grid('ml4h_data/p1/set-c/', 'ml4h_data/p1/Outcomes-c.txt')
-
-# RecordID -> PatientID
-# Minutes  -> Timestamp
-raw_a = raw_a.rename(columns={'RecordID': 'PatientID', 'Minutes': 'Timestamp'})
-raw_b = raw_b.rename(columns={'RecordID': 'PatientID', 'Minutes': 'Timestamp'})
-raw_c = raw_c.rename(columns={'RecordID': 'PatientID', 'Minutes': 'Timestamp'})
-
-# Capture Sparsity Masks
-mask_a = get_sparsity_mask(raw_a, STATIC_VARS)
-mask_b = get_sparsity_mask(raw_b, STATIC_VARS)
-mask_c = get_sparsity_mask(raw_c, STATIC_VARS)
-
-# Fit and Transform using DataPreprocessor 
-processor = DataPreprocessor(impute_outliers=True, impute_missing=True)
-scaled_a = processor.fit_transform(raw_a)
-scaled_b = processor.transform(raw_b)
-scaled_c = processor.transform(raw_c)
-
-# Restore Sparsity
-scaled_a = scaled_a.where(mask_a)
-scaled_b = scaled_b.where(mask_b)
-scaled_c = scaled_c.where(mask_c)
-
-######################################
-# Create Loaders
-train_triplets = dataframe_to_triplets(scaled_a, ALL_FEATURES)
-train_loader = DataLoader(PhysioNetDataset(train_triplets, labels_a), 
-                          batch_size=32, shuffle=True, collate_fn=collate_fn, generator=rnd_generator)
-
-val_triplets = dataframe_to_triplets(scaled_b, ALL_FEATURES)
-val_loader = DataLoader(PhysioNetDataset(val_triplets, labels_b), 
-                        batch_size=32, shuffle=False, collate_fn=collate_fn)
-
-test_triplets = dataframe_to_triplets(scaled_c, ALL_FEATURES)
-test_loader = DataLoader(PhysioNetDataset(test_triplets, labels_c), 
-                         batch_size=32, shuffle=False, collate_fn=collate_fn)
-
-######################################
-# Train the Model
-training_results = run_training_pipeline(
-    model=model,
-    optimizer=optimizer,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    device=device,
-    save_dir=save_directory,
-    epochs=epochs
-)
-current_save_dir = training_results["save_dir"]
-current_run_name = training_results["run_name"]
-
-######################################
-
-# Plot Metrics
-plot_training_results(training_results["history"], save_path=current_save_dir / "training_curves.png")
-
-######################################
-
-# Test on the Test Set
-best_model_path = current_save_dir / "best_model.pt"
-test_results = run_final_test(
-    model=model,
-    test_loader=test_loader,
-    checkpoint_path=str(best_model_path),
-    device=device
-)
-
-######################################
-
-# Report the metric
-report_test_results(test_results, model_name="Transformer (Task 2.3b)")
-
-######################################
-
-# Clean checkpoint directory
-clean_checkpoint_dir(base_dir="model_checkpoints/task_2_3b", keep_run_name=current_run_name)
-
-
 
