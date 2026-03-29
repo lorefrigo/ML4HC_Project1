@@ -1,6 +1,7 @@
 --- CATEGORICAL / CODE VARIABLES ---
 - GCS
 - Gender
+- MechVent
 
 --- NUMERICAL VARIABLES ---
 - ALP

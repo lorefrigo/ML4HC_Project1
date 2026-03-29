@@ -4,6 +4,32 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import PowerTransformer, StandardScaler, RobustScaler
 import warnings
 
+
+def clip_feature_values(
+    df: pd.DataFrame, 
+    features: list[str], 
+    min_val: float = -5.0, 
+    max_val: float = 5.0
+) -> pd.DataFrame:
+    """
+    Clips specific numerical features within a user-defined range.
+    
+    Args:
+        df: The input DataFrame (e.g., scaled_a).
+        features: List of column names to apply clipping to.
+        min_val: The lower bound (default -5.0).
+        max_val: The upper bound (default 5.0).
+        
+    Returns:
+        A copy of the DataFrame with clipped values.
+    """
+    df_clipped = df.copy()
+    valid_features = [f for f in features if f in df_clipped.columns]
+    
+    df_clipped[valid_features] = df_clipped[valid_features].clip(lower=min_val, upper=max_val)
+    print(f"Data clipped... for {len(valid_features)} features.")
+    return df_clipped
+
 class DataPreprocessor(BaseEstimator, TransformerMixin):
     """
     Class for handling data preprocessing for tasks 1.3 and 2.3b
@@ -46,9 +72,10 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         The list of columns generated after calling pd.get_dummies during fit. 
         Used to enforce aligned column structures during transform.
     """
-    def __init__(self, impute_outliers=True, impute_missing=False):
+    def __init__(self, impute_outliers=True, impute_missing=False, encode_cat=False):
         self.impute_outliers = impute_outliers
         self.impute_missing = impute_missing
+        self.encode_cat = encode_cat
         
         self.physiologically_plausible = {
             'Albumin': [0.1, 10.0],       'ALP': [0, 10000],           'ALT': [0, 20000],
@@ -66,7 +93,7 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         self.static_vars = ['Age', 'Gender', 'Height', 'Weight']
         self.exclude_vars = ['PatientID', 'Timestamp', 'Label', 'AgeBin']
         self.cat_vars = []
-        self.ordinal_vars = ['GCS', 'Gender']
+        self.ordinal_vars = ['GCS', 'Gender', 'MechVent']
         
         self.age_bins = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
         self.age_labels = ['0-9', '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70-79', '80-89', '90-99', '100-109', '110-119']
@@ -168,10 +195,27 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
                 self.standard_scaler_.fit(dfTemp[self.normal_vars_])
                 
         # Fit dummy columns reference to ensure output matching dummy structures
-        present_cat = [v for v in self.cat_vars if v in dfTemp.columns]
+        encode_vars = self.cat_vars.copy()
+        if self.encode_cat:
+            encode_vars.extend(['Gender', 'GCS', 'MechVent'])
+            
+        present_cat = [v for v in encode_vars if v in dfTemp.columns]
         if present_cat:
-            dummy_df = pd.get_dummies(dfTemp, columns=present_cat, drop_first=True)
-            self.dummy_columns_ = dummy_df.columns.tolist()
+            encoded_dfs = []
+            for var in present_cat:
+                if var in dfTemp.columns:
+                    # Apply string cast only to non-NaN values to prevent "nan" dummy variables
+                    dfTemp[var] = dfTemp[var].apply(lambda x: str(x) if pd.notna(x) else np.nan)
+                    
+                    # Safeguard: if there is only 1 unique valid value (k=1), do not drop it
+                    if dfTemp[var].nunique(dropna=True) <= 1:
+                        dummies = pd.get_dummies(dfTemp[[var]], columns=[var], drop_first=False, dtype=float)
+                    else:
+                        dummies = pd.get_dummies(dfTemp[[var]], columns=[var], drop_first=True, dtype=float)
+                    encoded_dfs.append(dummies)
+            
+            dfTemp = pd.concat([dfTemp.drop(columns=present_cat)] + encoded_dfs, axis=1)
+            self.dummy_columns_ = dfTemp.columns.tolist()
         else:
             self.dummy_columns_ = dfTemp.columns.tolist()
             
@@ -218,6 +262,9 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
         2. Imputes any remaining NaNs using the `_resolve_median_fallback` sequence.
         """
         df_processed = df.copy()
+        
+        if self.impute_missing and 'MechVent' in df_processed.columns:
+            df_processed['MechVent'] = df_processed['MechVent'].fillna(0.0)
         
         valid_dynamic = [v for v in self.dynamic_vars if v in df_processed.columns]
         if valid_dynamic:
@@ -299,16 +346,35 @@ class DataPreprocessor(BaseEstimator, TransformerMixin):
                 df_processed[present_normal] = self.standard_scaler_.transform(df_processed[present_normal])
 
         # Execute consistent fast one-hot-encoding
-        present_cat = [v for v in self.cat_vars if v in df_processed.columns]
+        encode_vars = self.cat_vars.copy()
+        if self.encode_cat:
+            encode_vars.extend(['Gender', 'GCS', 'MechVent'])
+            
+        present_cat = [v for v in encode_vars if v in df_processed.columns]
         if present_cat:
-            df_processed = pd.get_dummies(df_processed, columns=present_cat, drop_first=True)
+            encoded_dfs = []
+            for var in present_cat:
+                if var in df_processed.columns:
+                    # Apply string cast only to non-NaN values
+                    df_processed[var] = df_processed[var].apply(lambda x: str(x) if pd.notna(x) else np.nan)
+                    
+                    if df_processed[var].nunique(dropna=True) <= 1:
+                        dummies = pd.get_dummies(df_processed[[var]], columns=[var], drop_first=False, dtype=float)
+                    else:
+                        dummies = pd.get_dummies(df_processed[[var]], columns=[var], drop_first=True, dtype=float)
+                    encoded_dfs.append(dummies)
+            
+            df_processed = pd.concat([df_processed.drop(columns=present_cat)] + encoded_dfs, axis=1)
             
         if hasattr(self, 'dummy_columns_'):
             missing_cols = set(self.dummy_columns_) - set(df_processed.columns)
             for c in missing_cols:
-                df_processed[c] = 0
+                df_processed[c] = 0.0
             # Force strict column alignment with original fitted training pipeline
             valid_out_cols = [c for c in self.dummy_columns_ if c in df_processed.columns]
             df_processed = df_processed[valid_out_cols]
+            
+        if 'AgeBin' in df_processed.columns:
+            df_processed = df_processed.drop(columns=['AgeBin'])
         
         return df_processed
