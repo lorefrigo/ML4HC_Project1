@@ -78,10 +78,14 @@ def plot_training_results(
     plt.show()
 
 
-def report_test_results(results: dict[str, float], model_name: str = "Transformer (Task 2.3b)") -> None:
+def report_test_results(
+    results: dict[str, float], 
+    model_name: str = "Transformer (Task 2.3b)",
+    save_path: str | None = None
+) -> None:
     """
     Prints a formatted report of the test set performance and generates 
-    a LaTeX table row.
+    a LaTeX table row. Optionally plots and saves the metrics.
     """
     print("\n" + "="*45)
     print(f" FINAL PERFORMANCE REPORT: {model_name}")
@@ -102,3 +106,28 @@ def report_test_results(results: dict[str, float], model_name: str = "Transforme
     
     print(latex_row)
     print("="*45 + "\n")
+
+    # --- Metrics Plotting ---
+    metrics = ["AuROC", "AuPRC", "Loss"]
+    values = [results['auroc'], results['auprc'], results['loss']]
+    colors = ['forestgreen', 'crimson', 'royalblue']
+
+    plt.figure(figsize=(8, 5))
+    bars = plt.bar(metrics, values, color=colors, alpha=0.8, edgecolor='black', linewidth=1.2)
+    
+    # Add value labels on top of bars
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.01, f'{yval:.4f}', 
+                 ha='center', va='bottom', fontweight='bold')
+
+    plt.title(f'Final Test Metrics: {model_name}', fontsize=14, pad=15)
+    plt.ylabel('Value')
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.ylim(0, max(values) * 1.15) # Leave space for labels
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Test metrics plot saved to: {save_path}")
+    
+    plt.show()

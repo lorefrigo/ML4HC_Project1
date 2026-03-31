@@ -120,6 +120,7 @@ def train_one_epoch(
     data_format: str = "dense"
 ) -> Dict[str, float]:
     """Wrapper that routes to the specific training function based on data_format."""
+    device = torch.device(device)
     if data_format == "triplet":
         return _train_triplet_epoch(model, dataloader, optimizer, device)
     elif data_format == "dense":
@@ -208,6 +209,7 @@ def evaluate(
     data_format: str = "dense"
 ) -> Dict[str, float]:
     """Wrapper that routes to the specific evaluation function based on data_format."""
+    device = torch.device(device)
     if data_format == "triplet":
         return _evaluate_triplet(model, dataloader, device)
     elif data_format == "dense":
@@ -221,6 +223,7 @@ def run_training_pipeline(
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: torch.device,
+    scheduler: Any = None,
     save_dir: str = "model_checkpoints/task_2_3b",
     epochs: int = 20,
     data_format: str = "dense"
@@ -228,6 +231,7 @@ def run_training_pipeline(
     """
     Core training loop. Orchestrates training, evaluation, and checkpointing.
     """
+    device = torch.device(device)
     # Initialize the run directory
     save_dir, run_name = setup_run_directory(save_dir)
     
@@ -247,6 +251,14 @@ def run_training_pipeline(
 
         print(f"Epoch {epoch:02d} | Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f} | "
               f"Val AuROC: {val_metrics['auroc']:.4f} | Val AuPRC: {val_metrics['auprc']:.4f}")
+
+        # Update scheduler
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                # ReduceLROnPlateau typically monitors validation loss, but is now configured for AuPRC
+                scheduler.step(val_metrics["auprc"])
+            else:
+                scheduler.step()
 
         # Checkpointing 
         if val_metrics["auprc"] > best_val_auprc:
