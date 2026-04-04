@@ -1,0 +1,3 @@
+model,feature_set,n_features,val_auroc,val_auprc,test_auroc,test_auprc
+logistic_regression,last(dynamic)+static,41,0.8448508650973441,0.5201722892580587,0.8454415537285231,0.49783499138869913
+random_forest,last(dynamic)+static,41,0.8523019673987984,0.5034481514593252,0.8562280537097522,0.5074126818423617
