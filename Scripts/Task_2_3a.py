@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -10,16 +11,10 @@ from pathlib import Path
 
 from utilities.preprocessing import clip_feature_values
 from utilities.models import SwiGLUEncoderLayer, SimpleTransformer
-from utilities.training_functions import run_training_pipeline, run_final_test, set_seed
+from utilities.training_functions import run_training_pipeline, run_final_test, set_seed, LinearDropoutScheduler, StepDropoutScheduler, ConstantDropoutScheduler
 from utilities.plotting import plot_training_results, report_test_results
 from utilities.dir_manager import clean_checkpoint_dir
 
-###### CONSTANTS ######
-
-PREPROCESSED_DIR = "output/preprocessed_imputed_datasets"
-CLIP = 5.0
-BATCH_SIZE = 64
-EPOCHS = 2  
 
 ###### CLASSES & FUNCTIONS ######
 
@@ -79,7 +74,7 @@ def verify_patient_rows(df: pd.DataFrame, name: str, expected_rows: int = 49) ->
         return False
 
 
-def create_dataloader(df: pd.DataFrame, feature_cols: list[str], batch_size: int = 32, shuffle: bool = True) -> DataLoader:
+def create_dataloader(df: pd.DataFrame, feature_cols: list[str], batch_size: int = 32, shuffle: bool = True, generator: torch.Generator | None = None) -> DataLoader:
     """
     Converts a pandas DataFrame (with exactly 49 rows per patient) into a PyTorch DataLoader.
     """
@@ -105,14 +100,14 @@ def create_dataloader(df: pd.DataFrame, feature_cols: list[str], batch_size: int
     mask_tensor = torch.zeros((num_patients, expected_rows), dtype=torch.bool)
     
     dataset = TensorDataset(x_tensor, mask_tensor, y_tensor)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, generator=generator)
 
 def load_and_preprocess_dataset(file_path: str | Path, name: str, clip_val: float) -> tuple[pd.DataFrame, list[str]]:
     # Load the data
     df = pd.read_parquet(file_path)
     
     # Exclude metadata
-    exclude = ['PatientID', 'Timestamp', 'Label', 'AgeBin', 'RecordID']
+    exclude = ['PatientID', 'Timestamp', 'Label', 'AgeBin', 'RecordID', 'ICUType']
     feature_cols = [c for c in df.columns if c not in exclude]
     
     # Clipping
@@ -135,18 +130,36 @@ if __name__ == "__main__":
     PREPROCESSED_DIR = "output/preprocessed_imputed_datasets"
     base_dir_task_2_3a = "model_checkpoints/task_2_3a"
     CLIP = 5.0
-    EPOCHS = 4
-    BATCH_SIZE = 64
+    EPOCHS = 100
+    BATCH_SIZE = 128
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    SEED = 42
+    set_seed(SEED)
+    rnn_generator = torch.Generator()
+    rnn_generator.manual_seed(SEED)
 
     # Load and preprocess datasets
     df_a, FEATURE_COLS = load_and_preprocess_dataset(f"{PREPROCESSED_DIR}/preprocessed_set_a.parquet", "Set A", CLIP)
     df_b, _ = load_and_preprocess_dataset(f"{PREPROCESSED_DIR}/preprocessed_set_b.parquet", "Set B", CLIP)
     df_c, _ = load_and_preprocess_dataset(f"{PREPROCESSED_DIR}/preprocessed_set_c.parquet", "Set C", CLIP)
 
+    # Combine Set A and Set B for a unique split
+    df_combined = pd.concat([df_a, df_b], ignore_index=True)
+    patient_ids = df_combined['PatientID'].unique()
+    
+    # Shuffle IDs and split 
+    np.random.seed(42)  
+    np.random.shuffle(patient_ids)
+    split_idx = int(0.7 * len(patient_ids))
+    train_ids = patient_ids[:split_idx]
+    val_ids   = patient_ids[split_idx:]
+    
+    df_train = df_combined[df_combined['PatientID'].isin(train_ids)]
+    df_val   = df_combined[df_combined['PatientID'].isin(val_ids)]
+    
     # Create DataLoaders
-    train_loader = create_dataloader(df_a, FEATURE_COLS, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = create_dataloader(df_b, FEATURE_COLS, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = create_dataloader(df_train, FEATURE_COLS, batch_size=BATCH_SIZE, shuffle=True, generator=rnn_generator)
+    val_loader   = create_dataloader(df_val, FEATURE_COLS, batch_size=BATCH_SIZE, shuffle=False, generator=rnn_generator)
     test_loader  = create_dataloader(df_c, FEATURE_COLS, batch_size=BATCH_SIZE, shuffle=False)
 
     print(f"Created train_loader: {len(train_loader)} batches")
@@ -155,11 +168,12 @@ if __name__ == "__main__":
 
     # Model instantiation
     NUM_FEATURES  = len(FEATURE_COLS)
-    D_MODEL       = 64
-    NHEAD         = 1
-    NUM_LAYERS    = 2
-    DIM_FFORWARD  = 128
-    DROPOUT       = 0.1
+    D_MODEL       = 24
+    NHEAD         = 3
+    NUM_LAYERS    = 1
+    DIM_FFORWARD  = 16
+    DROPOUT_START       = 0.8
+    DROPOUT_END         = 0.6
 
     model = SimpleTransformer(
         num_features    = NUM_FEATURES,
@@ -167,16 +181,38 @@ if __name__ == "__main__":
         nhead           = NHEAD,
         num_layers      = NUM_LAYERS,
         dim_feedforward = DIM_FFORWARD,
-        dropout         = DROPOUT,
+        dropout         = DROPOUT_START,
+        swiglu_layer    = False,
+        loss            = "BCEWithLogitsLoss",
+        #gamma_plus      = 0.0,
+        #gamma_minus     = 2.0,
+        #m               = 0.02,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    # Selective weight decay: exclude biases and LayerNorm
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "bias" in name or "norm" in name.lower():
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+            
+    optimizer = torch.optim.AdamW([
+        {"params": decay_params, "weight_decay": 1e-2},
+        {"params": no_decay_params, "weight_decay": 0.0}
+    ], lr=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 
             mode='max', 
             factor=0.5, 
-            patience=2
+            patience=3
         )
+    
+    # Define dropout schedule: linear decay 
+    dropout_sched = LinearDropoutScheduler(start_rate=DROPOUT_START, end_rate=DROPOUT_END, total_epochs=EPOCHS//2)
 
     # Train model and save checkpoints
     results = run_training_pipeline(
@@ -187,7 +223,10 @@ if __name__ == "__main__":
         device=device,
         save_dir=base_dir_task_2_3a,
         epochs=EPOCHS,
+        monitor="auprc",
         scheduler=scheduler,
+        dropout_scheduler=dropout_sched,
+        patience=10,
         data_format="dense"
     )
 

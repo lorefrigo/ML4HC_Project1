@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import numpy as np
 import os
 import matplotlib.pyplot as plt
 import torch
@@ -177,7 +178,11 @@ if __name__ == "__main__":
         num_layers=2,
         d_time_emb=4,
         dim_feedforward=176,
-        dropout=0.1
+        dropout=0.1,
+        loss="AsymFocwithAPS",
+        gamma_plus=0.0,
+        gamma_minus=4.0,
+        m=0.05
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
@@ -188,36 +193,92 @@ if __name__ == "__main__":
             patience=2
         )
     
-    # build datasets from files
-    print("\n[STEP 2/5] Loading raw PhysiONet data (Sets A, B, and C)...")
-    raw_a, labels_a = load_raw_to_grid('ml4h_data/p1/set-a/', 'ml4h_data/p1/Outcomes-a.txt')
-    raw_b, labels_b = load_raw_to_grid('ml4h_data/p1/set-b/', 'ml4h_data/p1/Outcomes-b.txt')
-    raw_c, labels_c = load_raw_to_grid('ml4h_data/p1/set-c/', 'ml4h_data/p1/Outcomes-c.txt')
-    print("      Data sets loaded successfully.")
+    # Persistence logic: Check if pre-processed triplets exist
+    TRIPLETS_FILE = Path("output/triplets_task_2_3b.pt")
+    
+    if TRIPLETS_FILE.exists():
+        print(f"\n[INFO] Loading pre-processed triplets from {TRIPLETS_FILE}...")
+        # Use weights_only=False because triplets are complex Python objects (lists of tuples)
+        data = torch.load(TRIPLETS_FILE, weights_only=False)
+        train_triplets = data['train_triplets']
+        val_triplets = data['val_triplets']
+        test_triplets = data['test_triplets']
+        labels_a = data['labels_a']
+        labels_b = data['labels_b']
+        labels_c = data['labels_c']
+        valid_cols = data['valid_cols']
+        print("      Triplets and labels loaded successfully. Skipping preprocessing.")
+    else:
+        # build datasets from files
+        print("\n[STEP 2/5] Loading raw PhysiONet data (Sets A, B, and C)...")
+        raw_a, labels_a = load_raw_to_grid('ml4h_data/p1/set-a/', 'ml4h_data/p1/Outcomes-a.txt')
+        raw_b, labels_b = load_raw_to_grid('ml4h_data/p1/set-b/', 'ml4h_data/p1/Outcomes-b.txt')
+        raw_c, labels_c = load_raw_to_grid('ml4h_data/p1/set-c/', 'ml4h_data/p1/Outcomes-c.txt')
+        print("      Data sets loaded successfully.")
 
-    # Instantiate DataPreprocessor 
-    processor = DataPreprocessor(impute_outliers=True, impute_missing=False, encode_cat=True)
+        # Instantiate DataPreprocessor 
+        processor = DataPreprocessor(impute_outliers=True, impute_missing=False, encode_cat=True)
 
-    # preprocess data
-    print("\n[STEP 3/5] Preprocessing and scaling data...")
-    scaled_a, valid_cols = preprocess_pipeline(raw_a, processor, is_train=True, clip_val=CLIP)
-    scaled_b, _ = preprocess_pipeline(raw_b, processor, is_train=False, clip_val=CLIP)
-    scaled_c, _ = preprocess_pipeline(raw_c, processor, is_train=False, clip_val=CLIP)
-    print(f"      Preprocessing complete. Valid features: {len(valid_cols)}")
+        # preprocess data
+        print("\n[STEP 3/5] Preprocessing and scaling data...")
+        scaled_a, valid_cols = preprocess_pipeline(raw_a, processor, is_train=True, clip_val=CLIP)
+        scaled_b, _ = preprocess_pipeline(raw_b, processor, is_train=False, clip_val=CLIP)
+        scaled_c, _ = preprocess_pipeline(raw_c, processor, is_train=False, clip_val=CLIP)
+        print(f"      Preprocessing complete. Valid features: {len(valid_cols)}")
 
-    # Create Loaders
-    print("\n[STEP 4/5] Converting dataframes to sequences of triplets and creating DataLoaders...")
-    train_triplets = dataframe_to_triplets(scaled_a, valid_cols)
-    train_loader = DataLoader(PhysioNetDataset(train_triplets, labels_a), 
+        # Create Loaders
+        print("\n[STEP 4/5] Converting dataframes to sequences of triplets...")
+        train_triplets = dataframe_to_triplets(scaled_a, valid_cols)
+        val_triplets = dataframe_to_triplets(scaled_b, valid_cols)
+        test_triplets = dataframe_to_triplets(scaled_c, valid_cols)
+        
+        # Save processed data
+        print(f"      Saving processed triplets to {TRIPLETS_FILE}...")
+        TRIPLETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'train_triplets': train_triplets,
+            'val_triplets': val_triplets,
+            'test_triplets': test_triplets,
+            'labels_a': labels_a,
+            'labels_b': labels_b,
+            'labels_c': labels_c,
+            'valid_cols': valid_cols
+        }, TRIPLETS_FILE)
+    
+    # Create combined datasets for split (match Task_2_3a.py)
+    # Concatenate Sets A and B. First, we need to ensure triplets and labels stay aligned.
+    labels_a['triplets_temp'] = train_triplets
+    labels_b['triplets_temp'] = val_triplets
+    
+    combined_labels = pd.concat([labels_a, labels_b], ignore_index=True)
+    patient_ids = combined_labels['RecordID'].unique()
+    
+    # Shuffle IDs and split 70/30 (match Task_2_3a.py)
+    np.random.seed(42)  
+    np.random.shuffle(patient_ids)
+    split_idx = int(0.7 * len(patient_ids))
+    train_ids = patient_ids[:split_idx]
+    val_ids   = patient_ids[split_idx:]
+    
+    # Filter and sort by RecordID (PhysioNetDataset will also sort labels by RecordID)
+    df_train = combined_labels[combined_labels['RecordID'].isin(train_ids)].sort_values('RecordID')
+    df_val   = combined_labels[combined_labels['RecordID'].isin(val_ids)].sort_values('RecordID')
+    
+    train_triplets_split = df_train['triplets_temp'].tolist()
+    val_triplets_split   = df_val['triplets_temp'].tolist()
+    
+    # Create DataLoaders
+    print(f"\n[INFO] Creating DataLoaders with unique split ({len(df_train)} train, {len(df_val)} val)...")
+    train_loader = DataLoader(PhysioNetDataset(train_triplets_split, df_train.drop(columns=['triplets_temp'])), 
                             batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, generator=rnd_generator)
 
-    val_triplets = dataframe_to_triplets(scaled_b, valid_cols)
-    val_loader = DataLoader(PhysioNetDataset(val_triplets, labels_b), 
-                            batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, generator=rnd_generator)
+    val_loader = DataLoader(PhysioNetDataset(val_triplets_split, df_val.drop(columns=['triplets_temp'])), 
+                            batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, generator=rnd_generator)
 
-    test_triplets = dataframe_to_triplets(scaled_c, valid_cols)
     test_loader = DataLoader(PhysioNetDataset(test_triplets, labels_c), 
-                            batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, generator=rnd_generator)
+                            batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+
     
     # Train the Model
     print("\n[STEP 5/5] Starting Training Pipeline...")

@@ -3,6 +3,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class AsymmetricLoss(nn.Module):
+    def __init__(self, gamma_neg=4, gamma_pos=0, clip=0.05, eps=1e-8):
+        super(AsymmetricLoss, self).__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        # 1. Calculate probabilities
+        xs_pos = torch.sigmoid(logits)
+        xs_neg = 1 - xs_pos
+
+        # 2. Asymmetric Shifting (The "Margin")
+        # This mutes easy negatives by pushing their probability towards 1 
+        # (making the loss zero when clipped)
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1)
+
+        # 3. Basic Binary Cross Entropy
+        loss_pos = targets * torch.log(xs_pos.clamp(min=self.eps))
+        loss_neg = (1 - targets) * torch.log(xs_neg.clamp(min=self.eps))
+        
+        # 4. Asymmetric Focusing
+        # We apply different gamma exponents to the positive and negative parts
+        if self.gamma_pos > 0:
+            loss_pos *= (1 - xs_pos) ** self.gamma_pos
+        if self.gamma_neg > 0:
+            loss_neg *= (1 - xs_neg) ** self.gamma_neg
+
+        return -(loss_pos + loss_neg).mean()
+
+
 class SwiGLUEncoderLayer(nn.Module):
     """
     Custom Transformer Encoder Layer using Pre-LN and a SwiGLU FeedForward Network.
@@ -63,22 +96,43 @@ class SimpleTransformer(nn.Module):
         num_layers: int,
         dim_feedforward: int = 128,
         dropout: float = 0.1,
+        swiglu_layer: bool = False,
+        loss: str = "BCEWithLogitsLoss",
+        gamma_plus: float = 0.0,
+        gamma_minus: float = 4.0,
+        m: float = 0.05,
     ) -> None:
         super().__init__()
 
         # (B, T, F) -> (B, T, d_model)
         self.input_projection = nn.Linear(num_features, d_model)
 
-        encoder_layer = SwiGLUEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-        )
+        if swiglu_layer:
+            encoder_layer = SwiGLUEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+            )
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True,
+                activation='gelu'
+            )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.final_norm = nn.LayerNorm(d_model)
 
         self.classifier = nn.Linear(d_model, 1)
-        self.loss_fn = nn.BCEWithLogitsLoss()
+
+        if loss == "AsymFocwithAPS":
+            self.loss_fn = AsymmetricLoss(gamma_neg=gamma_minus, gamma_pos=gamma_plus, clip=m)
+        else:
+            self.loss_fn = nn.BCEWithLogitsLoss()
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -91,6 +145,7 @@ class SimpleTransformer(nn.Module):
         """
         x = self.input_projection(x)                                     # (B, T, d_model)
         x = self.transformer_encoder(x, src_key_padding_mask=mask)       # (B, T, d_model)
+        x = self.final_norm(x)                                          # (B, T, d_model)
 
         # Masked Global Average Pooling
         inv_mask = (torch.ones_like(mask).float().unsqueeze(-1) - mask.unsqueeze(-1).float()) # (B, T, 1)
@@ -150,21 +205,42 @@ class TripletTransformer(nn.Module):
         num_layers: int, 
         d_time_emb: int, 
         dim_feedforward: int = 128, 
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        swiglu_layer: bool = False,
+        loss: str = "BCEWithLogitsLoss",
+        gamma_plus: float = 0.0,
+        gamma_minus: float = 4.0,
+        m: float = 0.05,
     ) -> None:
         super().__init__()
         self.embedding = TripletEmbedding(d_model, d_time_emb)
         
-        encoder_layer = SwiGLUEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=dim_feedforward, 
-            dropout=dropout
-        )
+        if swiglu_layer:
+            encoder_layer = SwiGLUEncoderLayer(
+                d_model=d_model, 
+                nhead=nhead, 
+                dim_feedforward=dim_feedforward, 
+                dropout=dropout
+            )
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True,
+                activation='gelu'
+            )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.final_norm = nn.LayerNorm(d_model)
         
         self.classifier = nn.Linear(d_model, 1)
-        self.loss_fn = nn.BCEWithLogitsLoss()
+        
+        if loss == "AsymFocwithAPS":
+            self.loss_fn = AsymmetricLoss(gamma_neg=gamma_minus, gamma_pos=gamma_plus, clip=m)
+        else:
+            self.loss_fn = nn.BCEWithLogitsLoss()
 
     def forward(self, t: torch.Tensor, z: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # Generate initial embeddings from (t, z, v) triplets
@@ -172,6 +248,7 @@ class TripletTransformer(nn.Module):
         
         # Process sequence with self-attention 
         x = self.transformer_encoder(x, src_key_padding_mask=mask)
+        x = self.final_norm(x)
         
         # Masked Global Average Pooling
         mask_expanded = mask.unsqueeze(-1).float() 
