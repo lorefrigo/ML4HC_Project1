@@ -8,6 +8,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 
 
@@ -96,6 +98,20 @@ def clustering_metrics(embeddings_2d: np.ndarray, labels: np.ndarray) -> Dict[st
     }
 
 
+def preprocess_embeddings(
+    embeddings: np.ndarray,
+    normalize: bool = False,
+    pca_components: int | None = None,
+    seed: int = 42,
+) -> np.ndarray:
+    out = embeddings
+    if normalize:
+        out = StandardScaler().fit_transform(out)
+    if pca_components is not None:
+        out = PCA(n_components=pca_components, random_state=seed).fit_transform(out)
+    return out
+
+
 def plot_embeddings(
     embeddings_2d: np.ndarray,
     labels: np.ndarray,
@@ -128,6 +144,13 @@ def run_visualization(
     **kwargs: Any,
 ) -> Dict[str, float]:
     embeddings, labels = load_embeddings(embeddings_path, labels_path)
+
+    embeddings = preprocess_embeddings(
+        embeddings,
+        normalize=bool(kwargs.get("normalize", False)),
+        pca_components=kwargs.get("pca_components", None),
+        seed=seed,
+    )
 
     if method == "tsne":
         emb_2d = run_tsne(embeddings, seed=seed, perplexity=int(kwargs.get("perplexity", 30)))
