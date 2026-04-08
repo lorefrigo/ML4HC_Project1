@@ -80,33 +80,33 @@ def _compute_slopes(df: pd.DataFrame, dynamic_cols: list[str]) -> pd.DataFrame:
     return slopes
 
 
-# def build_engineered_features(df: pd.DataFrame, dynamic_cols: list[str]) -> tuple[pd.DataFrame, pd.Series]:
-#     """
-#     Q2.1(2)-style engineered features from time series per variable:
-#     - first, last, mean, min, max, std
-#     - range (max-min), delta (last-first)
-#     - slope (linear trend over time index)
-#     plus static variables.
-#     """
-#     df = df.sort_values(["PatientID", "Timestamp"])
-#     grouped = df.groupby("PatientID", sort=False)
+def build_engineered_features(df: pd.DataFrame, dynamic_cols: list[str]) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Q2.1(2)-style engineered features from time series per variable:
+    - first, last, mean, min, max, std
+    - range (max-min), delta (last-first)
+    - slope (linear trend over time index)
+    plus static variables.
+    """
+    df = df.sort_values(["PatientID", "Timestamp"])
+    grouped = df.groupby("PatientID", sort=False)
 
-#     agg = grouped[dynamic_cols].agg(["first", "last", "mean", "min", "max", "std"])
-#     agg.columns = [f"{col}_{stat}" for col, stat in agg.columns]
+    agg = grouped[dynamic_cols].agg(["first", "last", "mean", "min", "max", "std"])
+    agg.columns = [f"{col}_{stat}" for col, stat in agg.columns]
 
-#     range_df = grouped[dynamic_cols].max() - grouped[dynamic_cols].min()
-#     range_df = range_df.add_suffix("_range")
+    range_df = grouped[dynamic_cols].max() - grouped[dynamic_cols].min()
+    range_df = range_df.add_suffix("_range")
 
-#     delta_df = grouped[dynamic_cols].last() - grouped[dynamic_cols].first()
-#     delta_df = delta_df.add_suffix("_delta")
+    delta_df = grouped[dynamic_cols].last() - grouped[dynamic_cols].first()
+    delta_df = delta_df.add_suffix("_delta")
 
-#     slope_df = _compute_slopes(df, dynamic_cols)
+    slope_df = _compute_slopes(df, dynamic_cols)
 
-#     stat = grouped[STATIC_COLS].last()
-#     labels = grouped["Label"].last().astype(int)
+    stat = grouped[STATIC_COLS].last()
+    labels = grouped["Label"].last().astype(int)
 
-#     x = pd.concat([agg, range_df, delta_df, slope_df, stat], axis=1)
-#     return x, labels
+    x = pd.concat([agg, range_df, delta_df, slope_df, stat], axis=1)
+    return x, labels
 
 
 def build_windowed_features(
@@ -307,6 +307,11 @@ def main() -> None:
     x_val_eng_rf, _ = build_windowed_features(df_b, dynamic_cols, include_last12h_delta=False)
     x_test_eng_rf, _ = build_windowed_features(df_c, dynamic_cols, include_last12h_delta=False)
 
+    # Classic engineered features (first, last, mean, min, max, std, range, delta, slope)
+    x_train_slope_eng, _ = build_engineered_features(df_a, dynamic_cols)
+    x_val_slope_eng, _   = build_engineered_features(df_b, dynamic_cols)
+    x_test_slope_eng, _  = build_engineered_features(df_c, dynamic_cols)
+
     print(
         f"Patients Train/Val/Test: {len(y_train)}/{len(y_val)}/{len(y_test)} | "
         f"Simple features: {x_train_simple.shape[1]} | "
@@ -314,9 +319,9 @@ def main() -> None:
     )
 
     # --- Slope zero-value diagnostic ---
-    slope_cols = [c for c in x_train_eng.columns if c.endswith("_slope")]
+    slope_cols = [c for c in x_train_slope_eng.columns if c.endswith("_slope")]
     if slope_cols:
-        slope_vals = x_train_eng[slope_cols]
+        slope_vals = x_train_slope_eng[slope_cols]
         zero_frac = (slope_vals == 0.0).mean()  # fraction of patients with zero slope per variable
         print(f"\n[Slope diagnostic] {len(slope_cols)} slope features")
         print(f"  Mean zero-fraction across variables: {zero_frac.mean():.1%}")
@@ -338,6 +343,19 @@ def main() -> None:
     )
     rows.extend(simple_rows)
     print(f"\n[Timing] simple features experiment: {time.perf_counter() - t0:.1f}s")
+
+    t0 = time.perf_counter()
+    slope_eng_rows, _ = run_experiment(
+        feature_set_name="classic_engineered(first,last,mean,min,max,std,range,delta,slope)+static",
+        x_train=x_train_slope_eng,
+        y_train=y_train,
+        x_val=x_val_slope_eng,
+        y_val=y_val,
+        x_test=x_test_slope_eng,
+        y_test=y_test,
+    )
+    rows.extend(slope_eng_rows)
+    print(f"\n[Timing] classic engineered features experiment: {time.perf_counter() - t0:.1f}s")
 
     t0 = time.perf_counter()
     eng_rows, eng_models = run_experiment(

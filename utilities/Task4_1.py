@@ -10,11 +10,13 @@ Pipeline
 
 Usage
 -----
-    python utilities/Task4_1.py                      # zero-shot, llama3
-    python utilities/Task4_1.py --mode few-shot      # few-shot with Set A examples
-    python utilities/Task4_1.py --model mistral      # use a different Ollama model
-    python utilities/Task4_1.py --limit 50           # quick test on first 50 patients
+    python utilities/Task4_1.py                              # zero-shot, llama3 (local)
+    python utilities/Task4_1.py --mode few-shot              # few-shot with Set A examples
+    python utilities/Task4_1.py --model mistral              # use a different Ollama model
+    python utilities/Task4_1.py --limit 50                   # quick test on first 50 patients
     python utilities/Task4_1.py --limit 50 --mode few-shot --model mistral
+    python utilities/Task4_1.py --env cluster                # cluster defaults (llama3.1:latest)
+    python utilities/Task4_1.py --env cluster --model gemma3:1b  # override model on cluster
 """
 
 from __future__ import annotations
@@ -38,7 +40,8 @@ PROCESSED_DIR = Path("output/processed_sets")
 OUTPUT_DIR = Path("output/llm")
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "llama3"
+DEFAULT_MODEL         = "llama3"          # local Ollama (ollama pull llama3)
+CLUSTER_DEFAULT_MODEL = "llama3.1:latest" # /cluster/courses/ml4h/llm/bin/ollama list
 
 META_COLS = {"PatientID", "Timestamp", "RecordID", "Label"}
 STATIC_COLS = {"Age", "Gender", "Height", "Weight"}
@@ -163,6 +166,72 @@ def _trend(df: pd.DataFrame, col: str, t_mid: float) -> str:
     elif change < -0.10:
         return "\u2193"  # ↓
     return ""
+
+
+def build_short_patient_summary(patient_df: pd.DataFrame) -> str:
+    """
+    Compact 2-line summary for use as few-shot examples.
+    Retains only the strongest mortality predictors; drops trends, labs, and
+    redundant variables to minimise context-window usage.
+
+    Format (example):
+        68yo M MICU | HR 92bpm | SysBP 115mmHg | RR 18/min | Temp 37.1°C | GCS 12
+        MV NO | SpO2 95% | Lac 2.1mmol/L | pH 7.35 | Cr 1.1mg/dL | BUN 28mg/dL
+    """
+    df = patient_df.sort_values("Timestamp")
+
+    def _s(col: str) -> pd.Series:
+        return df[col].dropna() if col in df.columns else pd.Series(dtype=float)
+
+    # Demographics
+    age = df["Age"].dropna().iloc[0] if df["Age"].notna().any() else float("nan")
+    gender_code = df["Gender"].dropna().iloc[0] if df["Gender"].notna().any() else float("nan")
+    gender = "M" if gender_code == 1.0 else ("F" if gender_code == 0.0 else "?")
+    icu_code = (
+        df["ICUType"].dropna().iloc[0]
+        if "ICUType" in df.columns and df["ICUType"].notna().any()
+        else float("nan")
+    )
+    icu_name = ICU_TYPE_MAP.get(int(icu_code), "ICU") if pd.notna(icu_code) else "ICU"
+    age_str = f"{int(age)}yo" if pd.notna(age) else "?yo"
+
+    # Line 1 — demographics + core vitals (mean, GCS min)
+    parts1 = [f"{age_str} {gender} {icu_name}"]
+    for col, abbrev, unit, dec in [
+        ("HR",       "HR",    "bpm",  0),
+        ("NISysABP", "SysBP", "mmHg", 0),
+        ("RespRate", "RR",    "/min", 0),
+        ("Temp",     "Temp",  "°C",   1),
+    ]:
+        s = _s(col)
+        if len(s) > 0:
+            parts1.append(f"{abbrev} {_fmt(s.mean(), dec)}{unit}")
+    gcs = _s("GCS")
+    if len(gcs) > 0:
+        parts1.append(f"GCS {_fmt(gcs.min(), 0)}")
+
+    # Line 2 — key severity markers (last value for labs, mean for SpO2)
+    parts2: list[str] = []
+    mv = _s("MechVent")
+    if len(mv) > 0:
+        parts2.append(f"MV {'YES' if (mv > 0).any() else 'NO'}")
+    for col, abbrev, unit, dec, use_last in [
+        ("SaO2",       "SpO2", "%",      1, False),
+        ("Lactate",    "Lac",  "mmol/L", 1, True),
+        ("pH",         "pH",   "",       2, True),
+        ("Creatinine", "Cr",   "mg/dL",  1, True),
+        ("BUN",        "BUN",  "mg/dL",  0, True),
+    ]:
+        s = _s(col)
+        if len(s) == 0:
+            continue
+        val = s.iloc[-1] if use_last else s.mean()
+        unit_str = unit if unit else ""
+        parts2.append(f"{abbrev} {_fmt(val, dec)}{unit_str}")
+
+    line1 = " | ".join(parts1)
+    line2 = " | ".join(parts2)
+    return "\n".join([l for l in [line1, line2] if l])
 
 
 def build_patient_summary(patient_df: pd.DataFrame) -> str:
@@ -374,7 +443,7 @@ def parse_risk_score(response_text: str) -> float:
 
 def select_few_shot_examples(
     df_a: pd.DataFrame,
-    n_per_class: int = 3,
+    n_per_class: int = 2,
 ) -> list[tuple[str, int]]:
     """
     Pick balanced examples from Set A: n_per_class died + n_per_class survived.
@@ -393,7 +462,7 @@ def select_few_shot_examples(
     for pid in list(chosen_died) + list(chosen_survived):
         pat_df = df_a[df_a["PatientID"] == pid]
         label = int(labels[pid])
-        summary = build_patient_summary(pat_df)
+        summary = build_short_patient_summary(pat_df)   # compact: saves context window
         examples.append((summary, label))
 
     # Shuffle so died/survived don't appear in a predictable block
@@ -405,6 +474,9 @@ def select_few_shot_examples(
 # Main evaluation loop
 # ---------------------------------------------------------------------------
 
+CHECKPOINT_EVERY = 50   # save progress to disk every N patients
+
+
 def run_llm_evaluation(
     model: str,
     mode: str,          # "zero-shot" or "few-shot"
@@ -412,14 +484,22 @@ def run_llm_evaluation(
 ) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # --- Determine output path early (needed for checkpoint resume) ---
+    out_suffix = f"{model.replace(':', '_')}_{mode.replace('-', '_')}"
+    if limit is not None:
+        out_suffix += f"_n{limit}"
+    detail_path = OUTPUT_DIR / f"q4_1_results_{out_suffix}.csv"
+
     # --- Check Ollama is reachable ---
     try:
         requests.get("http://localhost:11434", timeout=5)
     except requests.exceptions.ConnectionError:
         print(
             "ERROR: Cannot connect to Ollama at localhost:11434.\n"
-            "Start Ollama with:  ollama serve\n"
-            f"Then pull your model:  ollama pull {model}"
+            "  Local:   ollama serve\n"
+            "  Cluster: OLLAMA_MODELS=/cluster/courses/ml4h/llm/models "
+            "/cluster/courses/ml4h/llm/bin/ollama serve\n"
+            f"Then ensure your model is available:  ollama pull {model}"
         )
         return
 
@@ -431,22 +511,33 @@ def run_llm_evaluation(
     if mode == "few-shot":
         df_a = pd.read_parquet(PROCESSED_DIR / "processed_set_a.parquet")
         print("Building few-shot examples from Set A...")
-        few_shot_examples = select_few_shot_examples(df_a, n_per_class=3)
+        few_shot_examples = select_few_shot_examples(df_a, n_per_class=2)
         print(f"  Selected {len(few_shot_examples)} examples "
               f"({sum(1 for _, l in few_shot_examples if l == 1)} died, "
               f"{sum(1 for _, l in few_shot_examples if l == 0)} survived)")
 
     # --- Get patient list ---
-    patient_ids = df_c["PatientID"].unique()
+    all_patient_ids = df_c["PatientID"].unique()
     labels_series = df_c.groupby("PatientID")["Label"].last().astype(int)
 
     if limit is not None:
-        patient_ids = patient_ids[:limit]
+        all_patient_ids = all_patient_ids[:limit]
 
-    print(f"\nMode: {mode} | Model: {model} | Patients: {len(patient_ids)}")
+    # --- Resume from checkpoint if it exists ---
+    results: list[dict] = []
+    done_ids: set = set()
+    if detail_path.exists():
+        existing_df = pd.read_csv(detail_path)
+        done_ids = set(existing_df["patient_id"].tolist())
+        results = existing_df.to_dict("records")
+        print(f"Checkpoint found: {len(done_ids)} patients already done, resuming...")
+
+    patient_ids = [pid for pid in all_patient_ids if pid not in done_ids]
+
+    print(f"\nMode: {mode} | Model: {model} | Patients: {len(patient_ids)} remaining "
+          f"({len(done_ids)} already done)")
     print("-" * 60)
 
-    results = []
     for i, pid in enumerate(patient_ids):
         pat_df = df_c[df_c["PatientID"] == pid]
         true_label = int(labels_series[pid])
@@ -492,8 +583,13 @@ def run_llm_evaluation(
                 else:
                     print(f"[{i+1}/{len(patient_ids)}] last response: '{raw_response[:60]}'")
 
+        # --- Checkpoint: save to disk every CHECKPOINT_EVERY patients ---
+        if (i + 1) % CHECKPOINT_EVERY == 0 or (i + 1) == len(patient_ids):
+            pd.DataFrame(results).to_csv(detail_path, index=False)
+            print(f"  [checkpoint] {len(results)} total results saved → {detail_path}")
+
     # --- Compute final metrics ---
-    results_df = pd.DataFrame(results)
+    results_df = pd.read_csv(detail_path)   # read from checkpoint (includes any prior run)
     ok_mask = results_df["status"] == "ok"
     ok_df = results_df[ok_mask]
 
@@ -519,7 +615,7 @@ def run_llm_evaluation(
     if limit is not None:
         out_suffix += f"_n{limit}"
 
-    detail_path = OUTPUT_DIR / f"q4_1_results_{out_suffix}.csv"
+    detail_path.unlink(missing_ok=True)   # remove checkpoint so next run starts fresh
     results_df.to_csv(detail_path, index=False)
     print(f"\nDetailed results saved to: {detail_path}")
 
@@ -544,7 +640,7 @@ def run_llm_evaluation(
     print(f"\n{'='*60}")
     print("Example patient summary (first evaluated patient):")
     print("-" * 60)
-    first_pid = patient_ids[0]
+    first_pid = all_patient_ids[0]
     print(build_patient_summary(df_c[df_c["PatientID"] == first_pid]))
     print("-" * 60)
 
@@ -555,12 +651,25 @@ def run_llm_evaluation(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Q4.1 LLM mortality prediction")
-    parser.add_argument("--model",  default=DEFAULT_MODEL, help="Ollama model name (default: llama3)")
+    parser.add_argument(
+        "--env",
+        default="local",
+        choices=["local", "cluster"],
+        help="Execution environment. 'cluster' sets default model to llama3.1:latest "
+             "(ETH Jupyter cluster). (default: local)",
+    )
+    parser.add_argument("--model",  default=None,
+                        help="Ollama model name. Defaults to llama3 (local) or "
+                             "llama3.1:latest (cluster) unless overridden.")
     parser.add_argument("--mode",   default="zero-shot",   choices=["zero-shot", "few-shot"],
                         help="Prompting mode (default: zero-shot)")
     parser.add_argument("--limit",  type=int, default=None,
                         help="Limit to first N patients for quick testing")
     args = parser.parse_args()
+
+    if args.model is None:
+        args.model = CLUSTER_DEFAULT_MODEL if args.env == "cluster" else DEFAULT_MODEL
+    print(f"[env={args.env}] model={args.model}  mode={args.mode}")
 
     run_llm_evaluation(model=args.model, mode=args.mode, limit=args.limit)
 

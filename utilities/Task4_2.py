@@ -21,6 +21,8 @@ Usage
     python utilities/Task4_2.py --embed-model mxbai-embed-large  # different model
     python utilities/Task4_2.py --limit 200                      # quick test
     python utilities/Task4_2.py --no-domain                      # skip domain embeddings
+    python utilities/Task4_2.py --env cluster                    # cluster defaults (llama3.1:latest)
+    python utilities/Task4_2.py --env cluster --embed-model nomic-embed-text  # override on cluster
 """
 
 from __future__ import annotations
@@ -60,7 +62,8 @@ OUTPUT_DIR      = Path("output/llm")
 PREPROCESSED_DIR = Path("output/preprocessed_imputed_datasets")
 CHECKPOINT_3A   = Path("model_checkpoints/task_2_3a/run_20260329_164728/best_model.pt")
 
-DEFAULT_EMBED_MODEL = "mxbai-embed-large"
+DEFAULT_EMBED_MODEL         = "mxbai-embed-large" # local: ollama pull mxbai-embed-large
+CLUSTER_DEFAULT_EMBED_MODEL = "llama3.1:latest"   # cluster: check with ollama list
 SEED   = 42
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -249,10 +252,17 @@ def plot_embeddings(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Q4.2 LLM embedding linear probe + visualisation")
     parser.add_argument(
+        "--env",
+        default="local",
+        choices=["local", "cluster"],
+        help="Execution environment. 'cluster' sets default embed model to llama3.1:latest "
+             "(ETH Jupyter cluster). (default: local)",
+    )
+    parser.add_argument(
         "--embed-model",
-        default=DEFAULT_EMBED_MODEL,
-        help=f"Ollama embedding model name (default: {DEFAULT_EMBED_MODEL}). "
-             f"Pull it first with:  ollama pull {DEFAULT_EMBED_MODEL}",
+        default=None,
+        help="Ollama embedding model name. Defaults to mxbai-embed-large (local) or "
+             "llama3.1:latest (cluster) unless overridden.",
     )
     parser.add_argument(
         "--limit",
@@ -266,6 +276,12 @@ def main() -> None:
         help="Skip domain-specific embedding extraction and visualisation",
     )
     args = parser.parse_args()
+
+    if args.embed_model is None:
+        args.embed_model = (
+            CLUSTER_DEFAULT_EMBED_MODEL if args.env == "cluster" else DEFAULT_EMBED_MODEL
+        )
+    print(f"[env={args.env}] embed_model={args.embed_model}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     np.random.seed(SEED)
