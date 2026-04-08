@@ -1,4 +1,5 @@
 import torch
+import pandas as pd
 import numpy as np
 from pathlib import Path
 from chronos import ChronosBoltPipeline
@@ -93,7 +94,7 @@ if __name__ == "__main__":
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SEED = 42
     rnd_generator = torch.Generator()
-    EPOCHS = 5 
+    EPOCHS = 50 
 
     set_seed(SEED)
     SAVE_DIR = "model_checkpoints/task_4_3"
@@ -107,15 +108,31 @@ if __name__ == "__main__":
     )
 
     # Identify dynamic variables by removing STATIC_VARS
+    # Load the data
     df_a, ALL_COLS = load_and_preprocess_dataset(f"{PREPROCESSED_DIR}/preprocessed_set_a.parquet", "Set A", CLIP)
     df_b, _ = load_and_preprocess_dataset(f"{PREPROCESSED_DIR}/preprocessed_set_b.parquet", "Set B", CLIP)
     df_c, _ = load_and_preprocess_dataset(f"{PREPROCESSED_DIR}/preprocessed_set_c.parquet", "Set C", CLIP)
 
+    # Combine Set A and Set B for a unique split (just like in Task_2_3a.py)
+    df_combined = pd.concat([df_a, df_b], ignore_index=True)
+    patient_ids = df_combined['PatientID'].unique()
+    
+    # Shuffle IDs and split 70/30
+    np.random.seed(42)  
+    np.random.shuffle(patient_ids)
+    split_idx = int(0.7 * len(patient_ids))
+    train_ids = patient_ids[:split_idx]
+    val_ids   = patient_ids[split_idx:]
+    
+    df_train = df_combined[df_combined['PatientID'].isin(train_ids)]
+    df_val   = df_combined[df_combined['PatientID'].isin(val_ids)]
+
     DYNAMIC_FEATURES = [col for col in ALL_COLS if col not in STATIC_VARS]
 
     # Re-create dataloaders using only dynamic features for Chronos 
-    train_loader = create_dataloader(df_a, DYNAMIC_FEATURES, batch_size=BATCH_SIZE, shuffle=False)
-    valid_loader = create_dataloader(df_b, DYNAMIC_FEATURES, batch_size=BATCH_SIZE, shuffle=False)
+    train_batch_size = BATCH_SIZE 
+    train_loader = create_dataloader(df_train, DYNAMIC_FEATURES, batch_size=train_batch_size, shuffle=False)
+    valid_loader = create_dataloader(df_val, DYNAMIC_FEATURES, batch_size=BATCH_SIZE, shuffle=False)
     test_loader  = create_dataloader(df_c, DYNAMIC_FEATURES, batch_size=BATCH_SIZE, shuffle=False)
 
     ##################
@@ -137,7 +154,7 @@ if __name__ == "__main__":
     y_test_np = y_test.numpy()
 
     # Logistic Regression model
-    logreg = LogisticRegression(max_iter=1000, random_state=42)
+    logreg = LogisticRegression(max_iter=2000, random_state=SEED)
 
     # Train on the Chronos embeddings
     print("Training Linear Probe on Chronos embeddings...")

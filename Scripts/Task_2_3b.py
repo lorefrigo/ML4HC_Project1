@@ -164,28 +164,42 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
     
     base_dir_task_2_3b = "model_checkpoints/task_2_3b"
-    epochs = 4
+    epochs = 50
     CLIP = 5.0
     SEED = 42
-    BATCH_SIZE = 32
+    BATCH_SIZE = 128
     set_seed(SEED)
     rnd_generator = torch.Generator().manual_seed(SEED)
 
     print("\n[STEP 1/5] Initializing TripletTransformer Model...")
     model = TripletTransformer(
-        d_model=64,
-        nhead=1,
-        num_layers=2,
+        d_model=66,
+        nhead=3,
+        num_layers=1,
         d_time_emb=4,
-        dim_feedforward=176,
-        dropout=0.1,
-        loss="AsymFocwithAPS",
-        gamma_plus=0.0,
-        gamma_minus=4.0,
-        m=0.05
+        dim_feedforward=64,
+        dropout=0.6,
+        loss="BCEWithLogitsLoss",
+        #gamma_plus=0.0,
+        #gamma_minus=4.0,
+        #m=0.05
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "bias" in name or "norm" in name.lower():
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+            
+
+    optimizer = torch.optim.AdamW([
+        {"params": decay_params, "weight_decay": 1e-2},
+        {"params": no_decay_params, "weight_decay": 0.0}
+    ], lr=1e-4)    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 
             mode='max', 
@@ -292,7 +306,9 @@ if __name__ == "__main__":
         save_dir=base_dir_task_2_3b,
         epochs=epochs,
         scheduler=scheduler,
-        data_format="triplet"
+        data_format="triplet", 
+        monitor="auprc",
+        patience=10
     )
 
     current_save_dir_2_3b = training_results["save_dir"]
